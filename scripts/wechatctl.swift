@@ -117,6 +117,7 @@ func ocr(_ img: CGImage) -> [(String, Float)] {
     }
     request.recognitionLevel = .accurate
     request.usesLanguageCorrection = false
+    request.recognitionLanguages = ["zh-Hans", "en-US"]
     request.minimumTextHeight = 0.02
     try? VNImageRequestHandler(cgImage: img, options: [:]).perform([request])
     return out
