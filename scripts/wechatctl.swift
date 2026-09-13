@@ -165,7 +165,13 @@ func verifyTitle(_ contact: String, timeoutMs: UInt32 = 2200) -> (Bool, String) 
         let texts = ocr(titleCrop(loadImage(url)))
         if ProcessInfo.processInfo.environment["WECHAT_KEEP_DEBUG"] != "1" { try? FileManager.default.removeItem(at: url) }
         observed = texts.map { $0.0 }.joined(separator: " | ")
-        if texts.contains(where: { contactMatches($0.0, contact) && $0.1 >= 0.55 }) { return (true, observed) }
+        let target = norm(contact)
+        let nonASCII = target.unicodeScalars.contains { $0.value >= 128 }
+        if texts.contains(where: {
+            let exact = norm($0.0) == target
+            let threshold: Float = (exact && nonASCII) ? 0.45 : 0.55
+            return contactMatches($0.0, contact) && $0.1 >= threshold
+        }) { return (true, observed) }
         sleepMs(90)
     } while (DispatchTime.now().uptimeNanoseconds - start) / 1_000_000 < UInt64(timeoutMs)
     return (false, observed)
