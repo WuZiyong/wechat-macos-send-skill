@@ -102,7 +102,9 @@ struct Attachment {
             guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
                 throw AttachmentError.invalidImage
             }
-            guard CGImageSourceGetCount(source) == 1 else { throw AttachmentError.animatedImage }
+            let frameCount = CGImageSourceGetCount(source)
+            guard frameCount > 0 else { throw AttachmentError.invalidImage }
+            guard frameCount == 1 else { throw AttachmentError.animatedImage }
             guard let data = try? Data(contentsOf: url), let pixels = pixelDigest(data) else {
                 throw AttachmentError.invalidImage
             }
