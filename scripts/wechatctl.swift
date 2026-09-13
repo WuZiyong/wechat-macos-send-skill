@@ -246,8 +246,9 @@ func requireAttachmentFocus(_ win: Win) {
     }
     let window = windowValue as! AXUIElement
     let focused = focusedValue as! AXUIElement
-    let sheets = axAttribute(window, kAXSheetsAttribute) as? [AXUIElement] ?? []
-    guard sheets.isEmpty,
+    let children = axAttribute(window, kAXChildrenAttribute) as? [AXUIElement] ?? []
+    let hasSheet = children.contains { (axAttribute($0, kAXRoleAttribute) as? String) == kAXSheetRole }
+    guard !hasSheet,
           (axAttribute(focused, kAXRoleAttribute) as? String) == kAXTextAreaRole,
           let owner = axAttribute(focused, kAXWindowAttribute), CFEqual(owner, window),
           let positionValue = axAttribute(window, kAXPositionAttribute),
