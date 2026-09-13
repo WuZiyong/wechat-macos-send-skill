@@ -5,8 +5,21 @@ import Vision
 import ImageIO
 import ApplicationServices
 import CryptoKit
+import Darwin
+
+var savedClipboard: ClipboardSnapshot?
+var operationLock: Int32 = -1
+
+func cleanup() {
+    if let snapshot = savedClipboard {
+        savedClipboard = nil
+        if !snapshot.restore(to: .general) { fputs("WARNING clipboard_restore_failed\n", stderr) }
+    }
+    if operationLock >= 0 { close(operationLock); operationLock = -1 }
+}
 
 func fail(_ message: String, _ code: Int32 = 2) -> Never {
+    cleanup()
     fputs("ERROR \(message)\n", stderr)
     exit(code)
 }
@@ -50,7 +63,7 @@ func getClipboard() -> String? {
     NSPasteboard.general.string(forType: .string)
 }
 
-struct Win { let id: CGWindowID; let bounds: CGRect; let name: String }
+struct Win { let id: CGWindowID; let bounds: CGRect; let name: String; let pid: pid_t }
 
 func mainWindow() -> Win {
     guard let list = CGWindowListCopyWindowInfo(.optionAll, kCGNullWindowID) as? [[String:Any]] else { fail("window_list") }
@@ -62,12 +75,13 @@ func mainWindow() -> Win {
         let alpha = w[kCGWindowAlpha as String] as? Double ?? 0
         guard layer == 0, alpha > 0 else { continue }
         guard let id = w[kCGWindowNumber as String] as? CGWindowID,
+              let pid = w[kCGWindowOwnerPID as String] as? pid_t,
               let b = w[kCGWindowBounds as String] as? [String:Any],
               let x = b["X"] as? Double, let y = b["Y"] as? Double,
               let width = b["Width"] as? Double, let height = b["Height"] as? Double,
               width > 400, height > 400 else { continue }
         let name = w[kCGWindowName as String] as? String ?? ""
-        candidates.append(Win(id: id, bounds: CGRect(x:x,y:y,width:width,height:height), name:name))
+        candidates.append(Win(id: id, bounds: CGRect(x:x,y:y,width:width,height:height), name:name, pid: pid))
     }
     guard !candidates.isEmpty else { fail("wechat_window_not_found", 4) }
     let titled = candidates.filter { $0.name == "微信" || $0.name.localizedCaseInsensitiveCompare("WeChat") == .orderedSame }
@@ -154,7 +168,10 @@ func readRecentState() -> [String:Any]? {
 
 func writeRecentState(_ status: String, key: String) {
     let obj: [String:Any] = ["status": status, "key": key, "ts": Date().timeIntervalSince1970]
-    if let data = try? JSONSerialization.data(withJSONObject: obj) { try? data.write(to: recentStateURL, options: .atomic) }
+    do {
+        let data = try JSONSerialization.data(withJSONObject: obj)
+        try data.write(to: recentStateURL, options: .atomic)
+    } catch { fail("recent_state_write_failed", 18) }
 }
 
 func verifyTitle(_ contact: String, timeoutMs: UInt32 = 2200) -> (Bool, String) {
@@ -187,97 +204,243 @@ func sendPoint(_ win: Win) -> CGPoint {
             y: win.bounds.maxY - 45)
 }
 
-func readComposer(_ win: Win) -> String? {
+/// Rich drafts must not be mistaken for an empty string. The sentinel is replaced
+/// only by a copy originating from WeChat, never by our original payload.
+func copyComposer(_ win: Win, attachment: Bool = false) -> Bool {
     click(composerPoint(win)); sleepMs(60)
+    if attachment { requireAttachmentFocus(win) }
     postKey(0, flags: .maskCommand); sleepMs(30)
     let sentinel = "__WECHAT_EMPTY_PROBE_\(UUID().uuidString)__"
-    setClipboard(sentinel); postKey(8, flags: .maskCommand); sleepMs(60)
-    let got = getClipboard()
-    return got == sentinel ? nil : got
-}
-
-let args = CommandLine.arguments
-let mode = args.count > 1 ? args[1] : ""
-if !AXIsProcessTrusted() { fail("accessibility_denied", 10) }
-
-if mode == "doctor" {
-    activateWeChat()
-    let w = mainWindow()
-    print("DOCTOR_OK window=\(w.id) x=\(Int(w.bounds.minX)) y=\(Int(w.bounds.minY)) w=\(Int(w.bounds.width)) h=\(Int(w.bounds.height))")
-    exit(0)
-}
-
-guard mode == "check" || mode == "dryrun" || mode == "send" else {
-    fail("usage: wechatctl <doctor|check CONTACT|dryrun CONTACT MESSAGE|send CONTACT MESSAGE>")
-}
-guard args.count >= 3 else { fail("missing_contact") }
-let contact = args[2]
-let message = args.count >= 4 ? args[3] : ""
-if contact.isEmpty { fail("empty_contact") }
-if (mode == "send" || mode == "dryrun") && (message.isEmpty || message.count > 2000) { fail("invalid_message") }
-
-let started = DispatchTime.now().uptimeNanoseconds
-let oldClipboard = getClipboard()
-defer { if let oldClipboard { setClipboard(oldClipboard) } }
-
-activateWeChat()
-setClipboard(contact)
-postKey(3, flags: .maskCommand); sleepMs(90)
-postKey(0, flags: .maskCommand); sleepMs(30)
-postKey(9, flags: .maskCommand); sleepMs(160)
-postKey(36); sleepMs(120)
-let verified = verifyTitle(contact)
-if !verified.0 { fail("contact_verify_failed observed=\(verified.1)", 11) }
-if mode == "check" {
-    let ms = (DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
-    print("CONTACT_OK contact=\(contact) elapsed_ms=\(ms)")
-    exit(0)
-}
-
-let key = sendKey(contact, message)
-if mode == "send", ProcessInfo.processInfo.environment["WECHAT_ALLOW_REPEAT"] != "1",
-   let state = readRecentState(), state["key"] as? String == key,
-   let ts = state["ts"] as? Double, Date().timeIntervalSince1970 - ts < 120 {
-    if state["status"] as? String == "sent" {
-        let ms = (DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
-        print("ALREADY_SENT_RECENTLY contact=\(contact) elapsed_ms=\(ms)")
-        exit(0)
+    setClipboard(sentinel)
+    let count = NSPasteboard.general.changeCount
+    postKey(8, flags: .maskCommand)
+    for _ in 0..<10 {
+        sleepMs(30)
+        if NSPasteboard.general.changeCount != count {
+            if attachment { requireAttachmentFocus(win) }
+            return true
+        }
     }
-    fail("recent_send_uncertain_do_not_retry", 17)
+    if attachment { requireAttachmentFocus(win) }
+    return false
 }
 
-let win = mainWindow()
-if let existing = readComposer(win), !existing.isEmpty {
-    fail("composer_not_empty", 12)
+func readComposer(_ win: Win) -> String? {
+    guard copyComposer(win) else { return nil }
+    // A copied image/file is nonempty even if it has no string representation.
+    return getClipboard() ?? "__WECHAT_RICH_DRAFT__"
 }
 
-setClipboard(message)
-click(composerPoint(win)); sleepMs(40)
-postKey(9, flags: .maskCommand); sleepMs(80)
-
-let verifyWin = mainWindow()
-guard let drafted = readComposer(verifyWin), drafted == message else {
-    fail("draft_verify_failed", 13)
+func axAttribute(_ element: AXUIElement, _ name: String) -> CFTypeRef? {
+    var value: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success else { return nil }
+    return value
 }
-if mode == "dryrun" {
-    postKey(51); sleepMs(60)
-    if readComposer(mainWindow()) != nil { fail("dryrun_cleanup_failed", 16) }
+
+/// Attachments use the inline rich composer only. A sheet, another window or an
+/// unidentifiable input is not a verified draft and must never trigger Send.
+func requireAttachmentFocus(_ win: Win) {
+    guard NSWorkspace.shared.frontmostApplication?.processIdentifier == win.pid else {
+        fail("attachment_focus_lost", 20)
+    }
+    let app = AXUIElementCreateApplication(win.pid)
+    guard let windowValue = axAttribute(app, kAXFocusedWindowAttribute),
+          CFGetTypeID(windowValue) == AXUIElementGetTypeID(),
+          let focusedValue = axAttribute(app, kAXFocusedUIElementAttribute),
+          CFGetTypeID(focusedValue) == AXUIElementGetTypeID() else {
+        fail("attachment_composer_unverifiable", 20)
+    }
+    let window = windowValue as! AXUIElement
+    let focused = focusedValue as! AXUIElement
+    let children = axAttribute(window, kAXChildrenAttribute) as? [AXUIElement] ?? []
+    let hasSheet = children.contains { (axAttribute($0, kAXRoleAttribute) as? String) == kAXSheetRole }
+    guard !hasSheet,
+          (axAttribute(focused, kAXRoleAttribute) as? String) == kAXTextAreaRole,
+          let owner = axAttribute(focused, kAXWindowAttribute), CFEqual(owner, window),
+          let positionValue = axAttribute(window, kAXPositionAttribute),
+          CFGetTypeID(positionValue) == AXValueGetTypeID(),
+          let sizeValue = axAttribute(window, kAXSizeAttribute),
+          CFGetTypeID(sizeValue) == AXValueGetTypeID() else {
+        fail("attachment_composer_unverifiable", 20)
+    }
+    var position = CGPoint.zero
+    var size = CGSize.zero
+    guard AXValueGetValue(positionValue as! AXValue, .cgPoint, &position),
+          AXValueGetValue(sizeValue as! AXValue, .cgSize, &size),
+          abs(position.x - win.bounds.minX) < 4, abs(position.y - win.bounds.minY) < 4,
+          abs(size.width - win.bounds.width) < 4, abs(size.height - win.bounds.height) < 4 else {
+        fail("attachment_window_changed", 20)
+    }
+}
+
+func acquireOperationLock() {
+    let path = recentStateURL.deletingLastPathComponent().appendingPathComponent("operation.lock").path
+    let descriptor = Darwin.open(path, O_CREAT | O_WRONLY, 0o600)
+    guard descriptor >= 0 else { fail("operation_lock_failed", 18) }
+    guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
+        close(descriptor)
+        fail("another_operation_in_progress", 18)
+    }
+    operationLock = descriptor
+}
+
+@main
+enum WeChatCLI {
+    static func main() {
+        defer { cleanup() }
+        let args = CommandLine.arguments
+        let mode = args.count > 1 ? args[1] : ""
+        let attachmentKind: AttachmentKind? = mode.hasSuffix("-image") ? .image : mode.hasSuffix("-file") ? .file : nil
+        let sending = ["send", "send-image", "send-file"].contains(mode)
+        let dryrun = mode == "dryrun"
+
+        // Offline diagnostics do not activate WeChat, change the clipboard, or paste.
+        if mode == "validate-image" || mode == "validate-file" {
+            guard args.count == 3, let attachmentKind else { fail("invalid_argument_count") }
+            do {
+                _ = try Attachment(kind: attachmentKind, path: args[2])
+                print("ATTACHMENT_OK kind=\(attachmentKind.rawValue)")
+            } catch { fail(String(describing: error), 19) }
+            return
+        }
+
+        if mode == "doctor" {
+            guard args.count == 2 else { fail("invalid_argument_count") }
+            if !AXIsProcessTrusted() { fail("accessibility_denied", 10) }
+            acquireOperationLock()
+            activateWeChat()
+            let w = mainWindow()
+            print("DOCTOR_OK window=\(w.id) x=\(Int(w.bounds.minX)) y=\(Int(w.bounds.minY)) w=\(Int(w.bounds.width)) h=\(Int(w.bounds.height))")
+            return
+        }
+
+        guard mode == "check" || dryrun || sending else {
+            fail("usage: wechatctl <doctor|check CONTACT|send CONTACT TEXT|send-image CONTACT PATH|send-file CONTACT PATH|dryrun CONTACT TEXT|validate-image PATH|validate-file PATH>")
+        }
+        guard args.count == (mode == "check" ? 3 : 4) else { fail("invalid_argument_count") }
+        let contact = args[2]
+        let message = args.count >= 4 ? args[3] : ""
+        if contact.isEmpty { fail("empty_contact") }
+        if attachmentKind == nil && (sending || dryrun) && (message.isEmpty || message.count > 2000) { fail("invalid_message") }
+        let payload: Attachment?
+        do { payload = try attachmentKind.map { try Attachment(kind: $0, path: message) } }
+        catch { fail(String(describing: error), 19) }
+        if !AXIsProcessTrusted() { fail("accessibility_denied", 10) }
+
+        let started = DispatchTime.now().uptimeNanoseconds
+        acquireOperationLock()
+        savedClipboard = ClipboardSnapshot(.general)
+
+        activateWeChat()
+        setClipboard(contact)
+        postKey(3, flags: .maskCommand); sleepMs(90)
+        postKey(0, flags: .maskCommand); sleepMs(30)
+        postKey(9, flags: .maskCommand); sleepMs(160)
+        postKey(36); sleepMs(120)
+        let verified = verifyTitle(contact)
+        if !verified.0 { fail("contact_verify_failed observed=\(verified.1)", 11) }
+        if mode == "check" {
+            let ms = (DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
+            print("CONTACT_OK contact=\(contact) elapsed_ms=\(ms)")
+            return
+        }
+
+        let key = payload?.sendKey(contact: contact) ?? sendKey(contact, message)
+        if sending, ProcessInfo.processInfo.environment["WECHAT_ALLOW_REPEAT"] != "1",
+           let state = readRecentState(), state["key"] as? String == key,
+           let ts = state["ts"] as? Double, Date().timeIntervalSince1970 - ts < 120 {
+            if state["status"] as? String == "sent" {
+                let ms = (DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
+                print("ALREADY_SENT_RECENTLY contact=\(contact) elapsed_ms=\(ms)")
+                return
+            }
+            fail("recent_send_uncertain_do_not_retry", 17)
+        }
+
+        let win = mainWindow()
+        if copyComposer(win, attachment: payload != nil) {
+            fail("composer_not_empty", 12)
+        }
+
+        if let payload {
+            sendAttachment(payload, contact: contact, key: key, win: win, started: started)
+            return
+        }
+
+        setClipboard(message)
+        click(composerPoint(win)); sleepMs(40)
+        postKey(9, flags: .maskCommand); sleepMs(80)
+
+        let verifyWin = mainWindow()
+        guard let drafted = readComposer(verifyWin), drafted == message else {
+            fail("draft_verify_failed", 13)
+        }
+        if dryrun {
+            postKey(51); sleepMs(60)
+            if readComposer(mainWindow()) != nil { fail("dryrun_cleanup_failed", 16) }
+            let ms = (DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
+            print("DRYRUN_OK contact=\(contact) elapsed_ms=\(ms)")
+            return
+        }
+
+        writeRecentState("pending", key: key)
+        click(sendPoint(verifyWin)); sleepMs(120)
+        var cleared = false
+        for _ in 0..<12 {
+            if readComposer(mainWindow()) == nil { cleared = true; break }
+            sleepMs(80)
+        }
+        if !cleared { fail("send_unconfirmed_composer_not_empty", 14) }
+
+        let postTitle = verifyTitle(contact, timeoutMs: 900)
+        if !postTitle.0 { fail("post_send_contact_verify_failed", 15) }
+        writeRecentState("sent", key: key)
+        let ms = (DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
+        print("SENT contact=\(contact) elapsed_ms=\(ms)")
+    }
+}
+
+func sendAttachment(_ payload: Attachment, contact: String, key: String,
+                    win: Win, started: UInt64) {
+    let stagingRoot = recentStateURL.deletingLastPathComponent().appendingPathComponent("attachments", isDirectory: true)
+    pruneStagedAttachments(in: stagingRoot)
+    let stagedURL: URL?
+    do {
+        stagedURL = payload.kind == .file ? try payload.stage(in: stagingRoot) : nil
+    } catch { fail(String(describing: error), 19) }
+
+    // Staging a large file may take time; do not reuse a stale empty-draft check.
+    guard verifyTitle(contact, timeoutMs: 900).0 else { fail("pre_paste_contact_verify_failed", 11) }
+    if copyComposer(win, attachment: true) { fail("composer_not_empty", 12) }
+    do { try payload.write(to: .general, stagedURL: stagedURL) }
+    catch { fail(String(describing: error), 19) }
+
+    // Some client versions can submit attachments on paste. Persist uncertainty
+    // before the first paste as well as before the explicit Send action.
+    writeRecentState("pending", key: key)
+    requireAttachmentFocus(win)
+    postKey(9, flags: .maskCommand)
+    sleepMs(200)
+    guard copyComposer(win, attachment: true), payload.matches(.general) else {
+        fail("attachment_draft_verify_failed", 21)
+    }
+
+    let title = verifyTitle(contact, timeoutMs: 900)
+    guard title.0 else { fail("pre_send_contact_verify_failed", 11) }
+    // Title verification can take time: re-read the draft immediately before Send.
+    guard copyComposer(win, attachment: true), payload.matches(.general) else {
+        fail("attachment_pre_send_mismatch", 21)
+    }
+    requireAttachmentFocus(win)
+    click(sendPoint(win)); sleepMs(150)
+    var cleared = false
+    for _ in 0..<24 {
+        if !copyComposer(win, attachment: true) { cleared = true; break }
+        sleepMs(100)
+    }
+    guard cleared else { fail("send_unconfirmed_attachment_remains", 14) }
+    guard verifyTitle(contact, timeoutMs: 900).0 else { fail("post_send_contact_verify_failed", 15) }
+    writeRecentState("sent", key: key)
     let ms = (DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
-    print("DRYRUN_OK contact=\(contact) elapsed_ms=\(ms)")
-    exit(0)
+    print("SENT contact=\(contact) kind=\(payload.kind.rawValue) elapsed_ms=\(ms)")
 }
-
-writeRecentState("pending", key: key)
-click(sendPoint(verifyWin)); sleepMs(120)
-var cleared = false
-for _ in 0..<12 {
-    if readComposer(mainWindow()) == nil { cleared = true; break }
-    sleepMs(80)
-}
-if !cleared { fail("send_unconfirmed_composer_not_empty", 14) }
-
-let postTitle = verifyTitle(contact, timeoutMs: 900)
-if !postTitle.0 { fail("post_send_contact_verify_failed", 15) }
-writeRecentState("sent", key: key)
-let ms = (DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
-print("SENT contact=\(contact) elapsed_ms=\(ms)")

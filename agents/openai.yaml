@@ -1,4 +1,4 @@
 interface:
   display_name: "WeChat Fast Sender"
-  short_description: "Send one verified WeChat message in one call"
-  default_prompt: "Use $wechat-macos-send to send this one WeChat message from my Mac with a single verified send call."
+  short_description: "Send one verified WeChat text, image, or file"
+  default_prompt: "Use $wechat-macos-send to send this one WeChat text, image, or file from my Mac with a single verified send call."

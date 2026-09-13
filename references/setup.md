@@ -10,6 +10,12 @@ This skill targets macOS with the desktop WeChat app installed and already logge
 - Accessibility permission for the process that launches the helper
 - Screen Recording / Screen & System Audio Recording permission so the helper can capture the WeChat window for local OCR
 
+Image/file sends additionally require an inline rich composer exposed as an
+Accessibility text area. Read [attachment behavior](attachments.md) before testing
+these modes on a new WeChat version. Separate attachment confirmation dialogs are
+not supported. `zsh scripts/test.sh` builds the helper and runs isolated attachment
+tests without opening WeChat or sending messages; live acceptance is separate.
+
 If running directly from Terminal, grant Terminal the permissions. If ChatGPT controls the Mac through Remote Desktop Commander, the authorized Node/remote process may also need Accessibility permission.
 
 ## Install and build once
@@ -20,7 +26,7 @@ Copy the whole skill folder into `~/.codex/skills/wechat-macos-send`, then compi
 ~/.codex/skills/wechat-macos-send/scripts/build.sh
 ```
 
-The shareable package intentionally relies on source + `build.sh` rather than a prebuilt machine-specific executable. `scripts/run.sh` will also build automatically if the binary is missing or the source is newer.
+The shareable package intentionally relies on source + `build.sh` rather than a prebuilt machine-specific executable. `scripts/run.sh` will also build automatically if the binary is missing or either Swift source is newer.
 
 For installation diagnostics, use the commands in [troubleshooting.md](troubleshooting.md). They are advanced checks and are not part of routine sending.
 
