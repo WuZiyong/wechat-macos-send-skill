@@ -18,8 +18,8 @@ func bitmap(_ red: Int) -> NSBitmapImageRep {
                                 bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
                                 isPlanar: false, colorSpaceName: .deviceRGB,
                                 bytesPerRow: 8, bitsPerPixel: 32)!
-    let pixel = [red, 0, 0, 255]
-    for y in 0..<2 { for x in 0..<2 { image.setPixel(pixel, atX: x, y: y) } }
+    var pixel = [red, 0, 0, 255]
+    for y in 0..<2 { for x in 0..<2 { image.setPixel(&pixel, atX: x, y: y) } }
     return image
 }
 
