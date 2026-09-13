@@ -1,0 +1,30 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "wechat-macos-send",
+  "version": "0.2.0",
+  "description": "Send one explicitly authorized WeChat message from macOS with local recipient and draft verification.",
+  "author": {
+    "name": "WuZiyong",
+    "url": "https://github.com/WuZiyong"
+  },
+  "homepage": "https://github.com/WuZiyong/wechat-macos-send-skill",
+  "repository": "https://github.com/WuZiyong/wechat-macos-send-skill",
+  "keywords": ["wechat", "macos", "messaging", "automation"],
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "WeChat macOS Send",
+        "shortDescription": "Send one verified WeChat message from your Mac",
+        "longDescription": "Send a single explicitly authorized WeChat message through an authorized Mac. Requires the Remote Desktop Commander plugin and the local WeChat helper installed on that Mac.",
+        "developerName": "WuZiyong",
+        "category": "Productivity",
+        "capabilities": ["Write"],
+        "websiteURL": "https://github.com/WuZiyong/wechat-macos-send-skill",
+        "defaultPrompt": [
+          "Send a WeChat message to a contact on my Mac.",
+          "Send this exact message to a WeChat group on my Mac."
+        ]
+      }
+    }
+  }
+}
